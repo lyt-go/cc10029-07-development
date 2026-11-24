@@ -70,6 +70,42 @@
       </tbody>
     </table>
 
+    <div v-if="isBackfill" class="backfill-panel" data-testid="backfill-panel">
+      <h3>补传链路操作</h3>
+      <div class="backfill-row">
+        <label class="filter-item">
+          <span>闭合窗口编号</span>
+          <input v-model="backfill.windowCode" data-testid="bf-window-code" placeholder="如 EXTR-SOUR-0001-…" />
+        </label>
+        <button class="btn primary" data-testid="bf-screen" type="button" @click="screenMissing">
+          筛选缺失并生成清单
+        </button>
+      </div>
+      <div class="backfill-row">
+        <label class="filter-item">
+          <span>清单编号</span>
+          <input v-model="backfill.manifestCode" data-testid="bf-manifest-code" placeholder="如 BACK-…" />
+        </label>
+        <button class="btn" type="button" @click="showReference">回查引用版本/已发范围</button>
+        <button class="btn" type="button" @click="claimManifest">领取清单</button>
+        <button class="btn" type="button" @click="showUnsent">未发送原因</button>
+        <button class="btn ghost" type="button" @click="reopen">重新打开</button>
+      </div>
+      <div class="backfill-row">
+        <label class="filter-item">
+          <span>补传批次 ID</span>
+          <input v-model="backfill.batchId" data-testid="bf-batch-id" placeholder="列表中的 id" />
+        </label>
+        <button class="btn primary" type="button" @click="sendBackfill">生成差量分片并发送</button>
+        <label class="filter-item">
+          <span>源记录主键</span>
+          <input v-model="backfill.recordKey" data-testid="bf-record-key" placeholder="如 R-SHARED" />
+        </label>
+        <button class="btn" type="button" @click="traceRecord">归属对照</button>
+      </div>
+      <pre v-if="backfill.output" class="backfill-output" data-testid="bf-output">{{ backfill.output }}</pre>
+    </div>
+
     <div v-if="showCreate" class="modal-backdrop" data-testid="create-modal">
       <form class="modal" @submit.prevent="submitCreate">
         <h3>登记{{ meta.entity }}</h3>
@@ -97,16 +133,24 @@
 import { computed, onMounted, ref } from 'vue'
 
 import {
+  claimBackfillManifest,
   createEntry,
   downloadEntries,
   listEntries,
+  loadManifestReference,
+  loadUnsentReport,
   moduleMeta,
+  reopenManifest,
   runAction as applyAction,
+  screenWindowMissing,
+  traceBackfillRecord,
+  transferBackfill,
 } from '@/api/backend-service'
 import type { EntryRow } from '@/data/types'
 
 const props = defineProps<{ moduleKey: string }>()
 const meta = moduleMeta(props.moduleKey)
+const isBackfill = props.moduleKey === 'backfill_manifest'
 const rows = ref<EntryRow[]>([])
 const total = ref(0)
 const errorMessage = ref('')
@@ -117,16 +161,16 @@ const creating = ref(false)
 const createValues = ref<Record<string, string>>({})
 const stats = computed(() => [
   { label: meta.metrics[0], value: total.value },
-  { label: meta.metrics[1], value: rows.value.filter((row) => row.status === meta.statuses[1]).length },
+  { label: meta.metrics[1], value: rows.value.filter((row: EntryRow) => row.status === meta.statuses[1]).length },
   {
     label: meta.metrics[2],
-    value: rows.value.filter((row) => row.status === meta.statuses[meta.statuses.length - 1]).length,
+    value: rows.value.filter((row: EntryRow) => row.status === meta.statuses[meta.statuses.length - 1]).length,
   },
 ])
 const statusSummary = computed(() =>
-  meta.statuses.map((status) => ({
+  meta.statuses.map((status: string) => ({
     status,
-    count: rows.value.filter((row) => String(row.status) === status).length,
+    count: rows.value.filter((row: EntryRow) => String(row.status) === status).length,
   })),
 )
 
@@ -145,7 +189,7 @@ async function exportRows() {
 }
 
 function openCreate() {
-  createValues.value = Object.fromEntries(meta.fields.map((field) => [field, '']))
+  createValues.value = Object.fromEntries(meta.fields.map((field: string) => [field, '']))
   errorMessage.value = ''
   showCreate.value = true
 }
@@ -184,6 +228,85 @@ async function reload() {
     total.value = payload.total
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '业务列表读取失败'
+  }
+}
+
+// -- 补传链路专用操作（仅补传清单模块展示） --
+const backfill = ref({
+  windowCode: '',
+  manifestCode: '',
+  batchId: '',
+  recordKey: '',
+  output: '',
+})
+
+function renderOutput(payload: unknown) {
+  backfill.value.output = JSON.stringify(payload, null, 2)
+}
+
+async function screenMissing() {
+  try {
+    const result = await screenWindowMissing(backfill.value.windowCode.trim())
+    renderOutput(result)
+    if (!result.error && result.manifest_code) {
+      backfill.value.manifestCode = result.manifest_code
+    }
+    await reload()
+  } catch (error) {
+    renderOutput({ error: error instanceof Error ? error.message : '筛选失败' })
+  }
+}
+
+async function showReference() {
+  try {
+    renderOutput(await loadManifestReference(backfill.value.manifestCode.trim()))
+  } catch (error) {
+    renderOutput({ error: error instanceof Error ? error.message : '回查失败' })
+  }
+}
+
+async function claimManifest() {
+  try {
+    const result = await claimBackfillManifest(backfill.value.manifestCode.trim())
+    renderOutput(result)
+    if (result.batch_id) backfill.value.batchId = String(result.batch_id)
+    await reload()
+  } catch (error) {
+    renderOutput({ error: error instanceof Error ? error.message : '领取失败' })
+  }
+}
+
+async function sendBackfill() {
+  try {
+    renderOutput(await transferBackfill(Number(backfill.value.batchId)))
+    await reload()
+  } catch (error) {
+    renderOutput({ error: error instanceof Error ? error.message : '发送失败' })
+  }
+}
+
+async function traceRecord() {
+  try {
+    renderOutput(await traceBackfillRecord(backfill.value.recordKey.trim()))
+  } catch (error) {
+    renderOutput({ error: error instanceof Error ? error.message : '归属对照失败' })
+  }
+}
+
+async function showUnsent() {
+  try {
+    renderOutput(await loadUnsentReport(backfill.value.manifestCode.trim()))
+  } catch (error) {
+    renderOutput({ error: error instanceof Error ? error.message : '未发送回查失败' })
+  }
+}
+
+async function reopen() {
+  try {
+    renderOutput(await reopenManifest(backfill.value.manifestCode.trim()))
+    await reload()
+  } catch (error) {
+    renderOutput({ error: error instanceof Error ? error.message : '重新打开失败' })
   }
 }
 

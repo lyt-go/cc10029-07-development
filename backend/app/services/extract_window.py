@@ -27,8 +27,16 @@ class ExtractWindowService(BaseModuleService):
         sources = [r for r in store.rows("source_register") if r.get("源端编号") == source_code]
         if not sources:
             raise ValueError(f"源端编号 {source_code} 未登记，请先完成源端登记")
+        # 同秒内为同一源端连续开窗时追加序号，保证窗口编号与产物文件名唯一
+        base_code = f"EXTR-{source_code}-{int(time.time())}"
+        window_code = base_code
+        existing = {r.get("窗口编号") for r in store.rows(self.MODULE)}
+        suffix = 2
+        while window_code in existing:
+            window_code = f"{base_code}-{suffix}"
+            suffix += 1
         entry, missing = self.create_entry({
-            "窗口编号": f"EXTR-{source_code}-{int(time.time())}",
+            "窗口编号": window_code,
             "源端编号": source_code,
             "增量字段": "updated_at",
             "窗口起点": time.strftime("%Y-%m-%dT00:00:00", time.localtime(time.time())),
@@ -122,3 +130,43 @@ class ExtractWindowService(BaseModuleService):
             "checksum": checksum,
             "message": msg,
         }
+
+    def apply_correction(self, window_id: int, record_key: str, corrected_fields: dict[str, Any]) -> dict[str, Any]:
+        """窗口闭合后收到源端更正：在抽取产物中定位同一条源记录并写入更正版本。
+
+        典型场景：相邻两个窗口交界处存在同一条更新记录，后一窗已先领用补传，
+        前一窗又在筛选结果确认后收到更正。更正只追加新版本行，不覆盖历史行，
+        以保证已确认清单引用的窗口版本仍可回查解释；同时写入更正事件日志。
+        """
+        window = self.get_entry(window_id)
+        if window is None:
+            return {"error": f"抽取窗口 {window_id} 不存在"}
+        window_code = window["窗口编号"]
+        artifact_file = self._data_dir("extracted") / f"{window_code}.jsonl"
+        records = self._read_jsonl(artifact_file)
+        if not records:
+            return {"error": f"窗口 {window_code} 缺少抽取产物，无法定位更正记录"}
+
+        key_field = "record_key"
+        located = [r for r in records if str(r.get(key_field) or r.get("source_record_id")
+                                           or f"{r.get('batch_key', '')}#L{r.get('line_no')}") == record_key]
+        if not located:
+            return {"error": f"窗口 {window_code} 中未找到源记录 {record_key}"}
+
+        latest = located[-1]
+        revised = dict(latest)
+        revised.update(corrected_fields)
+        revised[key_field] = record_key
+        revised["revision"] = int(latest.get("revision", 0)) + 1
+        revised["corrected_at"] = time.time()
+        revised["correction_note"] = "窗口闭合后源端更正，追加新版本行"
+        self._write_jsonl(artifact_file, [revised])
+
+        self._write_jsonl(
+            self._data_dir("events") / "window_correction_log.jsonl",
+            [{"action": "correction", "window_code": window_code, "record_key": record_key,
+              "revision": revised["revision"], "corrected_fields": list(corrected_fields.keys()),
+              "window_status": window.get("status"), "at": time.time()}],
+        )
+        return {"window_code": window_code, "record_key": record_key,
+                "revision": revised["revision"], "artifact_path": str(artifact_file)}
